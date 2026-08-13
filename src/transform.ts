@@ -70,67 +70,99 @@ export function parseTransformRequest(pathname: string, url: URL): TransformRequ
   }
 }
 
+async function fetchUpstream(sourcePath: string, rawQuery: string, signal: AbortSignal): Promise<Response> {
+  const query = rawQuery ? `?${rawQuery}` : ''
+  const upstream = await fetch(`${config.sourceOrigin}${sourcePath}${query}`, {
+    signal,
+    redirect: 'follow',
+    headers: {
+      Accept: '*/*',
+      'User-Agent': config.userAgent
+    }
+  })
+
+  if (!upstream.ok) {
+    await upstream.body?.cancel()
+    throw new HttpError(upstream.status === 404 ? 404 : 502, `Upstream returned ${upstream.status}`)
+  }
+
+  return upstream
+}
+
 /** Fetch an upstream object while enforcing MAX_SOURCE_BYTES even without Content-Length. */
-export async function fetchOriginal(sourcePath: string, rawQuery = ''): Promise<{ data: Uint8Array, contentType: string }> {
+export async function fetchOriginal(sourcePath: string): Promise<Uint8Array> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), config.fetchTimeoutMs)
 
   try {
-    const query = rawQuery ? `?${rawQuery}` : ''
-    const upstream = await fetch(`${config.sourceOrigin}${sourcePath}${query}`, {
-      signal: controller.signal,
-      redirect: 'follow',
-      headers: {
-        Accept: '*/*',
-        'User-Agent': config.userAgent
-      }
-    })
-
-    if (!upstream.ok) {
-      throw new HttpError(upstream.status === 404 ? 404 : 502, `Upstream returned ${upstream.status}`)
-    }
-
+    const upstream = await fetchUpstream(sourcePath, '', controller.signal)
     const declared = Number(upstream.headers.get('content-length') ?? 0)
-    if (declared > config.maxSourceBytes) {
+    const hasValidLength = Number.isSafeInteger(declared) && declared > 0
+    if (hasValidLength && declared > config.maxSourceBytes) {
+      await upstream.body?.cancel()
       throw new HttpError(413, 'Source object exceeds MAX_SOURCE_BYTES')
     }
 
     if (!upstream.body) throw new HttpError(502, 'Upstream returned no body')
 
-    const reader = upstream.body.getReader()
-    const chunks: Uint8Array[] = []
+    const initialCapacity = hasValidLength
+      ? declared
+      : Math.min(64 * 1024, config.maxSourceBytes)
+    let data = new Uint8Array(initialCapacity)
     let total = 0
+    const reader = upstream.body.getReader()
 
     while (true) {
       const { value, done } = await reader.read()
       if (done) break
       if (!value) continue
 
-      total += value.byteLength
-      if (total > config.maxSourceBytes) {
+      const nextTotal = total + value.byteLength
+      if (nextTotal > config.maxSourceBytes) {
         await reader.cancel()
         throw new HttpError(413, 'Source object exceeds MAX_SOURCE_BYTES')
       }
-      chunks.push(value)
+
+      if (nextTotal > data.byteLength) {
+        const capacity = Math.min(
+          config.maxSourceBytes,
+          Math.max(nextTotal, data.byteLength * 2)
+        )
+        const grown = new Uint8Array(capacity)
+        grown.set(data.subarray(0, total))
+        data = grown
+      }
+
+      data.set(value, total)
+      total = nextTotal
     }
 
-    const data = new Uint8Array(total)
-    let offset = 0
-    for (const chunk of chunks) {
-      data.set(chunk, offset)
-      offset += chunk.byteLength
-    }
-
-    return {
-      data,
-      contentType: upstream.headers.get('content-type') ?? 'application/octet-stream'
-    }
+    return data.subarray(0, total)
   } catch (error: any) {
     if (error instanceof HttpError) throw error
-    if (error?.name === 'AbortError') throw new HttpError(504, 'Upstream fetch timed out')
+    if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+      throw new HttpError(504, 'Upstream fetch timed out')
+    }
     throw new HttpError(502, 'Upstream fetch failed')
   } finally {
     clearTimeout(timer)
+  }
+}
+
+/** Return an upstream response whose body remains streaming and backpressured. */
+export async function fetchOriginalStream(sourcePath: string, rawQuery = ''): Promise<Response> {
+  try {
+    return await fetchUpstream(
+      sourcePath,
+      rawQuery,
+      AbortSignal.timeout(config.fetchTimeoutMs)
+    )
+  } catch (error: any) {
+    if (error instanceof HttpError) throw error
+    if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
+      throw new HttpError(504, 'Upstream fetch timed out')
+    }
+    throw new HttpError(502, 'Upstream fetch failed')
   }
 }
 
