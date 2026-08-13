@@ -21,6 +21,19 @@ function applyCacheHeaders(headers: Record<string, string | number | undefined>)
   headers['X-Content-Type-Options'] = 'nosniff'
 }
 
+function applyCorsHeaders(
+  headers: Record<string, string | number | undefined>,
+  request?: Request
+): void {
+  headers['Access-Control-Allow-Origin'] = '*'
+  headers['Access-Control-Allow-Methods'] =
+    request?.headers.get('access-control-request-method') ?? 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS'
+  headers['Access-Control-Allow-Headers'] =
+    request?.headers.get('access-control-request-headers') ?? '*'
+  headers['Access-Control-Expose-Headers'] = '*'
+  headers['Access-Control-Max-Age'] = '86400'
+}
+
 async function runTransform(spec: TransformRequest): Promise<Buffer> {
   const releaseFetch = await fetchSemaphore.acquire()
   let input: Uint8Array
@@ -55,13 +68,14 @@ function transformCoalesced(spec: TransformRequest): Promise<Buffer> {
   return promise
 }
 
-function streamResponse(upstream: Response, release: () => void): Response {
+function streamResponse(upstream: Response, release: () => void, request: Request): Response {
   const headers: Record<string, string> = {
     'Content-Type': upstream.headers.get('content-type') ?? 'application/octet-stream'
   }
   const contentLength = upstream.headers.get('content-length')
   if (contentLength) headers['Content-Length'] = contentLength
   applyCacheHeaders(headers)
+  applyCorsHeaders(headers, request)
 
   const reader = upstream.body!.getReader()
   let released = false
@@ -97,6 +111,11 @@ function streamResponse(upstream: Response, release: () => void): Response {
 }
 
 new Elysia()
+  .onRequest(({ request, set }) => applyCorsHeaders(set.headers, request))
+  .options('/*', ({ set }) => {
+    set.status = 204
+    return ''
+  })
   .get('/healthz', () => ({ ok: true, implementation: 'bun-elysia-sharp' }))
   .get('/*', async ({ request, set }) => {
     const url = new URL(request.url)
@@ -117,7 +136,7 @@ new Elysia()
           if (!upstream.body) {
             throw new HttpError(502, 'Upstream returned no body')
           }
-          return streamResponse(upstream, releaseFetch)
+          return streamResponse(upstream, releaseFetch, request)
         } catch (error) {
           releaseFetch()
           throw error
