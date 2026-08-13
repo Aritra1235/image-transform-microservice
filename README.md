@@ -6,8 +6,13 @@ Stack: Bun, Elysia, Sharp (libvips-backed).
 cp .env.example .env
 # edit SOURCE_ORIGIN
 
-docker build -t image-transform-bun .
-docker run --rm --cpus=1 --memory=512m -p 8080:8080 --env-file .env image-transform-bun
+docker compose up --build -d
+```
+
+Stop the service with:
+
+```bash
+docker compose down
 ```
 
 Test:
